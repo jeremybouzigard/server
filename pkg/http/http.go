@@ -118,7 +118,7 @@ func (h *Handler) handleGetSongByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetSongs handles a request to get albums.
+// handleGetSongs handles a request to get song data.
 func (h *Handler) handleGetSongs(w http.ResponseWriter, r *http.Request) {
 	v := r.URL.Query()
 	queries := parseQueries(v)
@@ -152,7 +152,7 @@ func (h *Handler) handleGetArtistByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetArtists handles a request to get albums.
+// handleGetArtists handles a request to get artist data.
 func (h *Handler) handleGetArtists(w http.ResponseWriter, r *http.Request) {
 	v := r.URL.Query()
 	queries := parseQueries(v)
@@ -167,7 +167,7 @@ func (h *Handler) handleGetArtists(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetGenres handles a request to get all genres.
+// handleGetGenres handles a request to get all genre data.
 func (h *Handler) handleGetGenres(w http.ResponseWriter, r *http.Request) {
 	genres, err := h.GenreService.Genres()
 	if err != nil {
