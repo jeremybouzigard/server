@@ -1,22 +1,28 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 
 	"github.com/gorilla/mux"
 	"github.com/jeremybouzigard/library"
 	"github.com/jeremybouzigard/server"
+	"github.com/jeremybouzigard/server/pkg/hls"
 )
 
 // Handler contains an HTTP router, a collection of all services to handle HTTP
 // requests, and a logger to log errors.
 type Handler struct {
-	Router *mux.Router
-	Logger *log.Logger
+	Router  *mux.Router
+	Logger  *log.Logger
+	TempDir string
 
 	GenreService  library.GenreService
 	AlbumService  library.AlbumService
@@ -32,8 +38,28 @@ func NewHandler() *Handler {
 	return h
 }
 
-// ServeHTTP routes HTTP requests to the appropriate handler function.
-func (h *Handler) ServeHTTP() {
+// setTempDir creates a temporary directory to store the files generated for
+// HTTP Live Streaming, including index files (playlists) and media stream
+// segments.
+func (h *Handler) setTempDir() error {
+	dir, err := ioutil.TempDir("", "hls")
+	if err != nil {
+		h.Logger.Fatal(err)
+		return err
+	}
+	h.TempDir = dir
+	return nil
+}
+
+// StartServer performs an initial setup and then starts the media server.
+func (h *Handler) StartServer() {
+	// Creates temporary directory for HLS files.
+	err := h.setTempDir()
+	if err != nil {
+		return
+	}
+
+	// Routes HTTP requests to the appropriate handler function.
 	h.Router.HandleFunc("/albums", h.handleGetAlbums).Methods("GET")
 	h.Router.HandleFunc("/albums/{id:[0-9]+}", h.handleGetAlbumByID).Methods("GET")
 	h.Router.HandleFunc("/genres", h.handleGetGenres).Methods("GET")
@@ -41,8 +67,36 @@ func (h *Handler) ServeHTTP() {
 	h.Router.HandleFunc("/artists/{id:[0-9]+}", h.handleGetArtistByID).Methods("GET")
 	h.Router.HandleFunc("/songs", h.handleGetSongs).Methods("GET")
 	h.Router.HandleFunc("/songs/{id:[0-9]+}", h.handleGetSongByID).Methods("GET")
+	h.Router.HandleFunc("/songs/{id:[0-9]+}/stream", h.handleGetStreamPlaylist).Methods("GET")
+	h.Router.HandleFunc("/songs/{id:[0-9]+}/{seg:fileSequence[0-9]+.aac}", h.handleGetStreamSegment).Methods("GET")
 	h.Router.PathPrefix("/").HandlerFunc(handleNotFound)
-	http.ListenAndServe(":8080", h.Router)
+
+	// Creates server.
+	srv := &http.Server{Addr: ":8080", Handler: h.Router}
+
+	// Defines shutdown behavior.
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, os.Interrupt)
+		<-sigint
+
+		// Shuts down when an interrupt signal is received.
+		if err := srv.Shutdown(context.Background()); err != nil {
+			h.Logger.Printf("HTTP server Shutdown: %v", err)
+		}
+
+		// On shutdown, removes temporary directory and closes idle connections.
+		h.Logger.Printf("HTTP server Shutdown")
+		os.RemoveAll(h.TempDir)
+		close(idleConnsClosed)
+	}()
+
+	// Begins listening for and serving requests.
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		h.Logger.Printf("HTTP server ListenAndServe: %v", err)
+	}
+	<-idleConnsClosed
 }
 
 // handleGetSongByID handles a request to get a song with the given ID.
@@ -152,6 +206,63 @@ func (h *Handler) handleGetAlbums(w http.ResponseWriter, r *http.Request) {
 		response := server.AlbumResponse{Data: albums}
 		encodeJSON(w, response)
 	}
+}
+
+// handleGetStreamPlaylist handles a request to get the stream index file for
+// the given song ID. An index file, or playlist, provides an ordered list of
+// paths of the media segment files.
+func (h *Handler) handleGetStreamPlaylist(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	songID := vars["id"]
+	if len(songID) > 0 {
+		song, err := h.SongService.Song(songID)
+		if err != nil {
+			handleError(w, err, http.StatusInternalServerError)
+		} else if song == nil {
+			handleNotFound(w, r)
+		} else {
+			h.servePlaylist(w, r, songID, song.Attributes.FilePath)
+		}
+	}
+}
+
+// servePlaylist serves the stream index (playlist) file for the given song ID.
+func (h *Handler) servePlaylist(w http.ResponseWriter, r *http.Request,
+	songID string, songPath string) {
+	playlistPath := fmt.Sprintf("%s/%s/prog_index.m3u8", h.TempDir, songID)
+	if _, err := os.Stat(playlistPath); os.IsNotExist(err) {
+		playlistDir := fmt.Sprintf("%s/%s", h.TempDir, songID)
+		os.Mkdir(playlistDir, 0700)
+		hls.Segment(songPath, playlistDir)
+	}
+	w.Header().Set("Content-Type", "application/x-mpegURL")
+	http.ServeFile(w, r, playlistPath)
+}
+
+// handleGetStreamSegment handles a request to get a media segment file.
+func (h *Handler) handleGetStreamSegment(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	songID := vars["id"]
+	if len(songID) > 0 {
+		song, err := h.SongService.Song(songID)
+		if err != nil {
+			handleError(w, err, http.StatusInternalServerError)
+		} else if song == nil {
+			handleNotFound(w, r)
+		} else {
+			seg := vars["seg"]
+			h.serveSegment(w, r, seg, songID)
+		}
+	}
+}
+
+// serveSegment serves a media segment file.
+func (h *Handler) serveSegment(w http.ResponseWriter, r *http.Request,
+	seg string, songID string) {
+	playlistDir := fmt.Sprintf("%s/%s", h.TempDir, songID)
+	segPath := fmt.Sprintf("%s/%s", playlistDir, seg)
+	w.Header().Set("Content-Type", "audio/aac")
+	http.ServeFile(w, r, segPath)
 }
 
 // parseQueries parses URL values for known possible queries.
